@@ -194,3 +194,25 @@ type StructFields struct{}
 func FieldsOf(structType interface{}, fieldNames ...string) StructFields {
 	return StructFields{}
 }
+
+// AllFieldsOf is like FieldsOf, but it detects and injects all the field names automatically.
+// It will use the field names of the struct as the field names to inject.
+//
+// Example:
+//
+//	type S struct {
+//		MyFoo Foo
+//		MyBar Bar
+//	}
+//	var Set = wire.NewSet(wire.AllFieldsOf(new(S)))
+//
+// If you want to exclude some fields, you can pass them as the second argument.
+//
+//	type S struct {
+//		MyFoo Foo
+//		MyBar Bar
+//	}
+//	var Set = wire.NewSet(wire.AllFieldsOf(new(S), "MyFoo"))
+func AllFieldsOf(structType interface{}, exclude ...string) StructFields {
+	return StructFields{}
+}
