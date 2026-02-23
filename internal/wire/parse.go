@@ -650,6 +650,12 @@ func (oc *objectCache) processExpr(info *types.Info, pkgPath string, expr ast.Ex
 				return nil, []error{notePosition(exprPos, err)}
 			}
 			return v, nil
+		case "AllFieldsOf":
+			v, err := processAllFieldsOf(oc.fset, info, call)
+			if err != nil {
+				return nil, []error{notePosition(exprPos, err)}
+			}
+			return v, nil
 		default:
 			return nil, []error{notePosition(exprPos, errors.New("unknown pattern"))}
 		}
@@ -1128,6 +1134,73 @@ func processFieldsOf(fset *token.FileSet, info *types.Info, call *ast.CallExpr) 
 			Name:   v.Name(),
 			Pkg:    v.Pkg(),
 			Pos:    v.Pos(),
+			Out:    out,
+		})
+	}
+	return fields, nil
+}
+
+// processAllFieldsOf creates a slice of fields from a wire.AllFieldsOf call.
+func processAllFieldsOf(fset *token.FileSet, info *types.Info, call *ast.CallExpr) ([]*Field, error) {
+	// Assumes that call.Fun is wire.AllFieldsOf.
+
+	if len(call.Args) < 1 {
+		return nil, notePosition(fset.Position(call.Pos()),
+			errors.New("call to AllFieldsOf must specify a struct type"))
+	}
+	const firstArgReqFormat = "first argument to AllFieldsOf must be a pointer to a struct or a pointer to a pointer to a struct; found %s"
+	structType := info.TypeOf(call.Args[0])
+	structPtr, ok := structType.(*types.Pointer)
+	if !ok {
+		return nil, notePosition(fset.Position(call.Pos()),
+			fmt.Errorf(firstArgReqFormat, types.TypeString(structType, nil)))
+	}
+
+	var struc *types.Struct
+	isPtrToStruct := false
+	switch t := structPtr.Elem().Underlying().(type) {
+	case *types.Pointer:
+		struc, ok = t.Elem().Underlying().(*types.Struct)
+		if !ok {
+			return nil, notePosition(fset.Position(call.Pos()),
+				fmt.Errorf(firstArgReqFormat, types.TypeString(struc, nil)))
+		}
+		isPtrToStruct = true
+	case *types.Struct:
+		struc = t
+	default:
+		return nil, notePosition(fset.Position(call.Pos()),
+			fmt.Errorf(firstArgReqFormat, types.TypeString(t, nil)))
+	}
+
+	excludedFields := make(map[string]struct{}, len(call.Args)-1)
+	for _, arg := range call.Args[1:] {
+		v, err := checkField(arg, struc)
+		if err != nil {
+			return nil, notePosition(fset.Position(call.Pos()), err)
+		}
+		excludedFields[v.Name()] = struct{}{}
+	}
+
+	fields := make([]*Field, 0, struc.NumFields())
+	for i := 0; i < struc.NumFields(); i++ {
+		f := struc.Field(i)
+		// Skip fields that are excluded.
+		if _, ok := excludedFields[f.Name()]; ok {
+			continue
+		}
+
+		out := []types.Type{f.Type()}
+		if isPtrToStruct {
+			// If the field is from a pointer to a struct, then
+			// wire.Fields also provides a pointer to the field.
+			out = append(out, types.NewPointer(f.Type()))
+		}
+		fields = append(fields, &Field{
+			Parent: structPtr.Elem(),
+			Name:   f.Name(),
+			Pkg:    f.Pkg(),
+			Pos:    f.Pos(),
 			Out:    out,
 		})
 	}

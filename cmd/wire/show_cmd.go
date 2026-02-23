@@ -28,8 +28,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goforj/wire/internal/wire"
 	"github.com/google/subcommands"
+	"github.com/kperreau/wire/internal/wire"
 	"golang.org/x/tools/go/types/typeutil"
 )
 

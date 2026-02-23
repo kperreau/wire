@@ -21,7 +21,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"runtime"
@@ -30,8 +29,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goforj/wire/internal/wire"
 	"github.com/google/subcommands"
+	"github.com/kperreau/wire/internal/wire"
 )
 
 // main wires up subcommands and executes the selected command.
@@ -189,7 +188,7 @@ func newGenerateOptions(headerFile string) (*wire.GenerateOptions, error) {
 	opts := new(wire.GenerateOptions)
 	if headerFile != "" {
 		var err error
-		opts.Header, err = ioutil.ReadFile(headerFile)
+		opts.Header, err = os.ReadFile(headerFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read header file %q: %v", headerFile, err)
 		}

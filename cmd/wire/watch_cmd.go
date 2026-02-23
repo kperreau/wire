@@ -27,8 +27,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/goforj/wire/internal/wire"
 	"github.com/google/subcommands"
+	"github.com/kperreau/wire/internal/wire"
 )
 
 // watchCmd implements the wire watch subcommand.

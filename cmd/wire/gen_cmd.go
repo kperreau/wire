@@ -21,8 +21,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/goforj/wire/internal/wire"
 	"github.com/google/subcommands"
+	"github.com/kperreau/wire/internal/wire"
 )
 
 type genCmd struct {
