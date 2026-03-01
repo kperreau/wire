@@ -17,6 +17,7 @@ package wire
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -75,6 +76,7 @@ func TestLoadAndGenerateModule(t *testing.T) {
 		"",
 	}, "\n"))
 
+	runGoModTidy(t, root)
 	env := append(os.Environ(), "GOWORK=off")
 	ctx := context.Background()
 
@@ -144,5 +146,17 @@ func writeFile(t *testing.T, path string, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
+	}
+}
+
+// runGoModTidy runs "go mod tidy" in dir so the temporary module has a valid go.sum
+// and the go tool no longer reports "updates to go.mod needed".
+func runGoModTidy(t *testing.T, dir string) {
+	t.Helper()
+	cmd := exec.Command("go", "mod", "tidy")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOWORK=off")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go mod tidy in %s: %v\n%s", dir, err, out)
 	}
 }

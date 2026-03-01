@@ -53,17 +53,17 @@ func TestGenerateUsesManifestCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("contentHashForFiles error: %v", err)
 	}
-	metaFiles, err := buildCacheFiles(files)
+	metaFiles, err := buildCacheFiles(files, nil)
 	if err != nil {
 		t.Fatalf("buildCacheFiles error: %v", err)
 	}
 	rootFiles := rootPackageFiles(pkg)
 	sort.Strings(rootFiles)
-	rootMeta, err := buildCacheFiles(rootFiles)
+	rootMeta, err := buildCacheFiles(rootFiles, nil)
 	if err != nil {
 		t.Fatalf("buildCacheFiles root error: %v", err)
 	}
-	rootHash, err := hashFiles(rootFiles)
+	rootHash, err := hashFiles(rootFiles, nil)
 	if err != nil {
 		t.Fatalf("hashFiles error: %v", err)
 	}

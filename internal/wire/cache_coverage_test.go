@@ -41,10 +41,10 @@ type cacheHookState struct {
 	extraCachePathsFunc func(string) []string
 	cacheKeyForPackage  func(*packages.Package, *GenerateOptions) (string, error)
 	detectOutputDir     func([]string) (string, error)
-	buildCacheFiles     func([]string) ([]cacheFile, error)
-	buildCacheFilesFrom func([]cacheFile) ([]cacheFile, error)
+	buildCacheFiles     func([]string, *FileStatCache) ([]cacheFile, error)
+	buildCacheFilesFrom func([]cacheFile, *FileStatCache) ([]cacheFile, error)
 	rootPackageFiles    func(*packages.Package) []string
-	hashFiles           func([]string) (string, error)
+	hashFiles           func([]string, *FileHashCache) (string, error)
 }
 
 var cacheHooksMu sync.Mutex
@@ -308,11 +308,11 @@ func TestCacheKeyMetaHit(t *testing.T) {
 	}
 	rootFiles := rootPackageFiles(pkg)
 	sort.Strings(rootFiles)
-	rootHash, err := hashFiles(rootFiles)
+	rootHash, err := hashFiles(rootFiles, nil)
 	if err != nil {
 		t.Fatalf("hashFiles error: %v", err)
 	}
-	metaFiles, err := buildCacheFiles(files)
+	metaFiles, err := buildCacheFiles(files, nil)
 	if err != nil {
 		t.Fatalf("buildCacheFiles error: %v", err)
 	}
@@ -346,16 +346,16 @@ func TestCacheKeyErrorPaths(t *testing.T) {
 	if _, err := cacheKeyForPackage(pkg, &GenerateOptions{}); err == nil {
 		t.Fatal("expected cacheKeyForPackage error")
 	}
-	if _, err := buildCacheFiles([]string{filepath.Join(t.TempDir(), "missing.go")}); err == nil {
+	if _, err := buildCacheFiles([]string{filepath.Join(t.TempDir(), "missing.go")}, nil); err == nil {
 		t.Fatal("expected buildCacheFiles error")
 	}
 	if _, err := contentHashForPaths("example.com/missing", &GenerateOptions{}, []string{filepath.Join(t.TempDir(), "missing.go")}); err == nil {
 		t.Fatal("expected contentHashForPaths error")
 	}
-	if _, err := hashFiles([]string{filepath.Join(t.TempDir(), "missing.go")}); err == nil {
+	if _, err := hashFiles([]string{filepath.Join(t.TempDir(), "missing.go")}, nil); err == nil {
 		t.Fatal("expected hashFiles error")
 	}
-	if got, err := hashFiles(nil); err != nil || got != "" {
+	if got, err := hashFiles(nil, nil); err != nil || got != "" {
 		t.Fatalf("expected empty hashFiles result, got %q err=%v", got, err)
 	}
 }
@@ -370,13 +370,13 @@ func TestCacheMetaMatches(t *testing.T) {
 	opts := &GenerateOptions{}
 	files := packageFiles(pkg)
 	sort.Strings(files)
-	metaFiles, err := buildCacheFiles(files)
+	metaFiles, err := buildCacheFiles(files, nil)
 	if err != nil {
 		t.Fatalf("buildCacheFiles error: %v", err)
 	}
 	rootFiles := rootPackageFiles(pkg)
 	sort.Strings(rootFiles)
-	rootHash, err := hashFiles(rootFiles)
+	rootHash, err := hashFiles(rootFiles, nil)
 	if err != nil {
 		t.Fatalf("hashFiles error: %v", err)
 	}
@@ -625,17 +625,17 @@ func TestReadManifestResultsPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("contentHashForFiles error: %v", err)
 	}
-	metaFiles, err := buildCacheFiles(files)
+	metaFiles, err := buildCacheFiles(files, nil)
 	if err != nil {
 		t.Fatalf("buildCacheFiles error: %v", err)
 	}
 	rootFiles := rootPackageFiles(pkg)
 	sort.Strings(rootFiles)
-	rootMeta, err := buildCacheFiles(rootFiles)
+	rootMeta, err := buildCacheFiles(rootFiles, nil)
 	if err != nil {
 		t.Fatalf("buildCacheFiles error: %v", err)
 	}
-	rootHash, err := hashFiles(rootFiles)
+	rootHash, err := hashFiles(rootFiles, nil)
 	if err != nil {
 		t.Fatalf("hashFiles error: %v", err)
 	}
@@ -726,13 +726,13 @@ func TestWriteManifestBranches(t *testing.T) {
 	writeManifest(wd, env, patterns, opts, []*packages.Package{okPkg})
 
 	detectOutputDirFunc = state.detectOutputDir
-	buildCacheFilesFunc = func([]string) ([]cacheFile, error) {
+	buildCacheFilesFunc = func([]string, *FileStatCache) ([]cacheFile, error) {
 		return nil, errors.New("build")
 	}
 	writeManifest(wd, env, patterns, opts, []*packages.Package{okPkg})
 
 	call := 0
-	buildCacheFilesFunc = func([]string) ([]cacheFile, error) {
+	buildCacheFilesFunc = func([]string, *FileStatCache) ([]cacheFile, error) {
 		call++
 		if call > 1 {
 			return nil, errors.New("root")
@@ -745,7 +745,7 @@ func TestWriteManifestBranches(t *testing.T) {
 	writeManifest(wd, env, patterns, opts, []*packages.Package{okPkg})
 
 	buildCacheFilesFunc = state.buildCacheFiles
-	hashFilesFunc = func([]string) (string, error) {
+	hashFilesFunc = func([]string, *FileHashCache) (string, error) {
 		return "", errors.New("hash")
 	}
 	writeManifest(wd, env, patterns, opts, []*packages.Package{okPkg})
@@ -779,23 +779,23 @@ func TestManifestValidationAndExtras(t *testing.T) {
 	state := saveCacheHooks()
 	t.Cleanup(func() { restoreCacheHooks(state) })
 
-	if manifestValid(nil) {
+	if manifestValid(nil, nil) {
 		t.Fatal("expected nil manifest invalid")
 	}
-	if manifestValid(&cacheManifest{Version: "bad"}) {
+	if manifestValid(&cacheManifest{Version: "bad"}, nil) {
 		t.Fatal("expected version mismatch")
 	}
-	if manifestValid(&cacheManifest{Version: cacheVersion}) {
+	if manifestValid(&cacheManifest{Version: cacheVersion}, nil) {
 		t.Fatal("expected missing env hash")
 	}
 
 	tempDir := t.TempDir()
 	file := writeTempFile(t, tempDir, "valid.go", "package valid\n")
-	files, err := buildCacheFiles([]string{file})
+	files, err := buildCacheFiles([]string{file}, nil)
 	if err != nil {
 		t.Fatalf("buildCacheFiles error: %v", err)
 	}
-	rootHash, err := hashFiles([]string{file})
+	rootHash, err := hashFiles([]string{file}, nil)
 	if err != nil {
 		t.Fatalf("hashFiles error: %v", err)
 	}
@@ -806,74 +806,74 @@ func TestManifestValidationAndExtras(t *testing.T) {
 		Packages:   []manifestPackage{{PkgPath: "example.com/valid", Files: files, RootFiles: files, ContentHash: "hash", RootHash: rootHash}},
 		ExtraFiles: nil,
 	}
-	if !manifestValid(valid) {
+	if !manifestValid(valid, nil) {
 		t.Fatal("expected valid manifest")
 	}
 
 	invalidExtra := cloneManifest(valid)
 	invalidExtra.ExtraFiles = []cacheFile{{Path: filepath.Join(tempDir, "missing.go")}}
-	if manifestValid(invalidExtra) {
+	if manifestValid(invalidExtra, nil) {
 		t.Fatal("expected invalid extra files")
 	}
 
 	extraMismatch := cloneManifest(valid)
 	extraMismatch.ExtraFiles = []cacheFile{files[0]}
 	extraMismatch.ExtraFiles[0].Size++
-	if manifestValid(extraMismatch) {
+	if manifestValid(extraMismatch, nil) {
 		t.Fatal("expected extra file metadata mismatch")
 	}
 
 	invalidPkg := cloneManifest(valid)
 	invalidPkg.Packages[0].ContentHash = ""
-	if manifestValid(invalidPkg) {
+	if manifestValid(invalidPkg, nil) {
 		t.Fatal("expected invalid content hash")
 	}
 
 	invalidRoot := cloneManifest(valid)
 	invalidRoot.Packages[0].RootHash = ""
-	if manifestValid(invalidRoot) {
+	if manifestValid(invalidRoot, nil) {
 		t.Fatal("expected invalid root hash")
 	}
 
 	invalidFiles := cloneManifest(valid)
 	invalidFiles.Packages[0].Files = []cacheFile{{Path: filepath.Join(tempDir, "missing.go")}}
-	if manifestValid(invalidFiles) {
+	if manifestValid(invalidFiles, nil) {
 		t.Fatal("expected invalid package files")
 	}
 
 	fileMismatch := cloneManifest(valid)
 	fileMismatch.Packages[0].Files = []cacheFile{files[0]}
 	fileMismatch.Packages[0].Files[0].Size++
-	if manifestValid(fileMismatch) {
+	if manifestValid(fileMismatch, nil) {
 		t.Fatal("expected package file mismatch")
 	}
 
 	invalidRootFiles := cloneManifest(valid)
 	invalidRootFiles.Packages[0].RootFiles = []cacheFile{{Path: filepath.Join(tempDir, "missing.go")}}
-	if manifestValid(invalidRootFiles) {
+	if manifestValid(invalidRootFiles, nil) {
 		t.Fatal("expected invalid root files")
 	}
 
 	rootMismatch := cloneManifest(valid)
 	rootMismatch.Packages[0].RootFiles = []cacheFile{files[0]}
 	rootMismatch.Packages[0].RootFiles[0].Size++
-	if manifestValid(rootMismatch) {
+	if manifestValid(rootMismatch, nil) {
 		t.Fatal("expected root file mismatch")
 	}
 
 	emptyRoot := cloneManifest(valid)
 	emptyRoot.Packages[0].RootFiles = nil
-	if manifestValid(emptyRoot) {
+	if manifestValid(emptyRoot, nil) {
 		t.Fatal("expected empty root files")
 	}
 
 	badHash := cloneManifest(valid)
 	badHash.Packages[0].RootHash = "bad"
-	if manifestValid(badHash) {
+	if manifestValid(badHash, nil) {
 		t.Fatal("expected root hash mismatch")
 	}
 
-	if _, err := buildCacheFilesFromMeta([]cacheFile{{Path: filepath.Join(tempDir, "missing.go")}}); err == nil {
+	if _, err := buildCacheFilesFromMeta([]cacheFile{{Path: filepath.Join(tempDir, "missing.go")}}, nil); err == nil {
 		t.Fatal("expected buildCacheFilesFromMeta error")
 	}
 
@@ -969,11 +969,11 @@ func TestManifestValidHookBranches(t *testing.T) {
 
 	tempDir := t.TempDir()
 	file := writeTempFile(t, tempDir, "hook.go", "package hook\n")
-	files, err := buildCacheFiles([]string{file})
+	files, err := buildCacheFiles([]string{file}, nil)
 	if err != nil {
 		t.Fatalf("buildCacheFiles error: %v", err)
 	}
-	rootHash, err := hashFiles([]string{file})
+	rootHash, err := hashFiles([]string{file}, nil)
 	if err != nil {
 		t.Fatalf("hashFiles error: %v", err)
 	}
@@ -985,83 +985,83 @@ func TestManifestValidHookBranches(t *testing.T) {
 		ExtraFiles: []cacheFile{files[0]},
 	}
 
-	buildCacheFilesFromMetaFunc = func(in []cacheFile) ([]cacheFile, error) {
+	buildCacheFilesFromMetaFunc = func(in []cacheFile, _ *FileStatCache) ([]cacheFile, error) {
 		if len(in) == 1 && in[0].Path == files[0].Path {
 			return []cacheFile{}, nil
 		}
-		return buildCacheFilesFromMeta(in)
+		return buildCacheFilesFromMeta(in, nil)
 	}
-	if manifestValid(base) {
+	if manifestValid(base, nil) {
 		t.Fatal("expected extra file length mismatch")
 	}
 
 	restoreCacheHooks(state)
 	emptyRoot := cloneManifest(base)
 	emptyRoot.Packages[0].RootFiles = nil
-	if manifestValid(emptyRoot) {
+	if manifestValid(emptyRoot, nil) {
 		t.Fatal("expected empty root files")
 	}
 
 	restoreCacheHooks(state)
-	buildCacheFilesFromMetaFunc = func(in []cacheFile) ([]cacheFile, error) {
+	buildCacheFilesFromMetaFunc = func(in []cacheFile, _ *FileStatCache) ([]cacheFile, error) {
 		if len(in) == 1 && in[0].Path == file {
 			return nil, errors.New("pkg files")
 		}
-		return buildCacheFilesFromMeta(in)
+		return buildCacheFilesFromMeta(in, nil)
 	}
 	noExtra := cloneManifest(base)
 	noExtra.ExtraFiles = nil
-	if manifestValid(noExtra) {
+	if manifestValid(noExtra, nil) {
 		t.Fatal("expected pkg files error")
 	}
 
 	restoreCacheHooks(state)
-	buildCacheFilesFromMetaFunc = func(in []cacheFile) ([]cacheFile, error) {
+	buildCacheFilesFromMetaFunc = func(in []cacheFile, _ *FileStatCache) ([]cacheFile, error) {
 		if len(in) == 1 && in[0].Path == file {
 			return []cacheFile{}, nil
 		}
-		return buildCacheFilesFromMeta(in)
+		return buildCacheFilesFromMeta(in, nil)
 	}
-	if manifestValid(noExtra) {
+	if manifestValid(noExtra, nil) {
 		t.Fatal("expected pkg files length mismatch")
 	}
 
 	restoreCacheHooks(state)
 	call := 0
-	buildCacheFilesFromMetaFunc = func(in []cacheFile) ([]cacheFile, error) {
+	buildCacheFilesFromMetaFunc = func(in []cacheFile, _ *FileStatCache) ([]cacheFile, error) {
 		call++
 		if call == 2 {
 			return nil, errors.New("root files")
 		}
-		return buildCacheFilesFromMeta(in)
+		return buildCacheFilesFromMeta(in, nil)
 	}
-	if manifestValid(noExtra) {
+	if manifestValid(noExtra, nil) {
 		t.Fatal("expected root files error")
 	}
 
 	restoreCacheHooks(state)
 	call = 0
-	buildCacheFilesFromMetaFunc = func(in []cacheFile) ([]cacheFile, error) {
+	buildCacheFilesFromMetaFunc = func(in []cacheFile, _ *FileStatCache) ([]cacheFile, error) {
 		call++
 		if call == 2 {
 			return []cacheFile{}, nil
 		}
-		return buildCacheFilesFromMeta(in)
+		return buildCacheFilesFromMeta(in, nil)
 	}
-	if manifestValid(noExtra) {
+	if manifestValid(noExtra, nil) {
 		t.Fatal("expected root files length mismatch")
 	}
 
 	restoreCacheHooks(state)
 	call = 0
-	buildCacheFilesFromMetaFunc = func(in []cacheFile) ([]cacheFile, error) {
+	buildCacheFilesFromMetaFunc = func(in []cacheFile, _ *FileStatCache) ([]cacheFile, error) {
 		call++
 		if call == 2 {
 			return []cacheFile{{Path: file, Size: files[0].Size + 1}}, nil
 		}
-		return buildCacheFilesFromMeta(in)
+		return buildCacheFilesFromMeta(in, nil)
 	}
-	if manifestValid(noExtra) {
+	if manifestValid(noExtra, nil) {
 		t.Fatal("expected root files mismatch")
 	}
 }

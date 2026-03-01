@@ -72,6 +72,7 @@ func TestCacheInvalidation(t *testing.T) {
 		"",
 	}, "\n"))
 
+	runGoModTidy(t, root)
 	env := append(os.Environ(), "GOWORK=off")
 	ctx := context.Background()
 	opts := &GenerateOptions{}
@@ -178,6 +179,7 @@ func TestManifestInvalidation(t *testing.T) {
 		"",
 	}, "\n"))
 
+	runGoModTidy(t, root)
 	env := append(os.Environ(), "GOWORK=off")
 	ctx := context.Background()
 	opts := &GenerateOptions{}
@@ -191,7 +193,7 @@ func TestManifestInvalidation(t *testing.T) {
 	if !ok {
 		t.Fatal("expected manifest after Generate")
 	}
-	if !manifestValid(manifest) {
+	if !manifestValid(manifest, nil) {
 		t.Fatal("expected manifest to be valid")
 	}
 
@@ -204,7 +206,7 @@ func TestManifestInvalidation(t *testing.T) {
 		"",
 	}, "\n"))
 
-	if manifestValid(manifest) {
+	if manifestValid(manifest, nil) {
 		t.Fatal("expected manifest to be invalid after source update")
 	}
 }
@@ -259,6 +261,7 @@ func TestManifestInvalidationGoMod(t *testing.T) {
 		"",
 	}, "\n"))
 
+	runGoModTidy(t, root)
 	env := append(os.Environ(), "GOWORK=off")
 	ctx := context.Background()
 	opts := &GenerateOptions{}
@@ -272,7 +275,7 @@ func TestManifestInvalidationGoMod(t *testing.T) {
 	if !ok {
 		t.Fatal("expected manifest after Generate")
 	}
-	if !manifestValid(manifest) {
+	if !manifestValid(manifest, nil) {
 		t.Fatal("expected manifest to be valid")
 	}
 
@@ -286,7 +289,7 @@ func TestManifestInvalidationGoMod(t *testing.T) {
 		"",
 	}, "\n"))
 
-	if manifestValid(manifest) {
+	if manifestValid(manifest, nil) {
 		t.Fatal("expected manifest to be invalid after go.mod update")
 	}
 }
@@ -341,6 +344,7 @@ func TestManifestInvalidationSameTimestamp(t *testing.T) {
 		"",
 	}, "\n"))
 
+	runGoModTidy(t, root)
 	env := append(os.Environ(), "GOWORK=off")
 	ctx := context.Background()
 	opts := &GenerateOptions{}
@@ -354,7 +358,7 @@ func TestManifestInvalidationSameTimestamp(t *testing.T) {
 	if !ok {
 		t.Fatal("expected manifest after Generate")
 	}
-	if !manifestValid(manifest) {
+	if !manifestValid(manifest, nil) {
 		t.Fatal("expected manifest to be valid")
 	}
 
@@ -379,7 +383,7 @@ func TestManifestInvalidationSameTimestamp(t *testing.T) {
 		t.Fatalf("Chtimes failed: %v", err)
 	}
 
-	if manifestValid(manifest) {
+	if manifestValid(manifest, nil) {
 		t.Fatal("expected manifest to be invalid after same-timestamp content update")
 	}
 }

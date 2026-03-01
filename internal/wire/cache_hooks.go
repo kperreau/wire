@@ -15,8 +15,9 @@
 package wire
 
 import (
-	"encoding/json"
 	"os"
+
+	"github.com/goccy/go-json"
 )
 
 var (

@@ -24,11 +24,13 @@ import (
 	"go/printer"
 	"go/token"
 	"go/types"
-	"io/ioutil"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -56,7 +58,7 @@ func (gen GenerateResult) Commit() error {
 	if len(gen.Content) == 0 {
 		return nil
 	}
-	return ioutil.WriteFile(gen.OutputPath, gen.Content, 0666)
+	return os.WriteFile(gen.OutputPath, gen.Content, 0666)
 }
 
 // GenerateOptions holds options for Generate.
@@ -65,6 +67,59 @@ type GenerateOptions struct {
 	Header           []byte
 	PrefixOutputFile string
 	Tags             string
+	// FileHashCache, if set, caches file content hashes for the duration of Generate
+	// to avoid re-reading the same files when many packages share dependencies.
+	FileHashCache *FileHashCache
+	// FileStatCache, if set, caches os.Stat results (path -> Size, ModTime) for the run
+	// to avoid repeated stat calls in buildCacheFiles / buildCacheFilesFromMeta.
+	FileStatCache *FileStatCache
+}
+
+// FileHashCache caches SHA256(content) per path; safe for concurrent use.
+// Used to reduce disk I/O when computing cache keys for multiple packages.
+type FileHashCache struct {
+	m sync.Map // path string -> hash string
+}
+
+func (c *FileHashCache) load(path string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	v, ok := c.m.Load(path)
+	if !ok {
+		return "", false
+	}
+	return v.(string), true
+}
+
+func (c *FileHashCache) store(path, hash string) {
+	if c == nil {
+		return
+	}
+	c.m.Store(path, hash)
+}
+
+// FileStatCache caches cacheFile (path, size, modTime) per path; safe for concurrent use.
+type FileStatCache struct {
+	m sync.Map // path string -> *cacheFile
+}
+
+func (c *FileStatCache) load(path string) (*cacheFile, bool) {
+	if c == nil {
+		return nil, false
+	}
+	v, ok := c.m.Load(path)
+	if !ok {
+		return nil, false
+	}
+	return v.(*cacheFile), true
+}
+
+func (c *FileStatCache) store(path string, cf *cacheFile) {
+	if c == nil {
+		return
+	}
+	c.m.Store(path, cf)
 }
 
 // Generate performs dependency injection for the packages that match the given
@@ -83,6 +138,9 @@ func Generate(ctx context.Context, wd string, env []string, patterns []string, o
 	if opts == nil {
 		opts = &GenerateOptions{}
 	}
+	// Create fresh caches at the start so manifest validation and this run see current file state.
+	opts.FileHashCache = &FileHashCache{}
+	opts.FileStatCache = &FileStatCache{}
 	if cached, ok := readManifestResults(wd, env, patterns, opts); ok {
 		return cached, nil
 	}
@@ -92,14 +150,90 @@ func Generate(ctx context.Context, wd string, env []string, patterns []string, o
 	if len(errs) > 0 {
 		return nil, errs
 	}
+	// Only run code generation for packages that might contain wire injectors.
+	// This avoids full type-checking for the vast majority of packages in a monorepo.
+	wirePkgs := packagesWithWire(pkgs)
+	wireSet := make(map[string]int) // PkgPath -> index in wirePkgs
+	for i, p := range wirePkgs {
+		wireSet[p.PkgPath] = i
+	}
+	wireGenerated := make([]GenerateResult, len(wirePkgs))
+	workers := max(min(runtime.GOMAXPROCS(0), 4), 1)
+	var wg sync.WaitGroup
+	for i := 0; i < len(wirePkgs); i += workers {
+		end := min(i+workers, len(wirePkgs))
+		for j := i; j < end; j++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				wireGenerated[idx] = generateForPackage(ctx, wirePkgs[idx], loader, opts)
+			}(j)
+		}
+		wg.Wait()
+	}
+	// Preserve original order and include empty results for packages without wire.
 	generated := make([]GenerateResult, len(pkgs))
 	for i, pkg := range pkgs {
-		generated[i] = generateForPackage(ctx, pkg, loader, opts)
+		if idx, ok := wireSet[pkg.PkgPath]; ok {
+			generated[i] = wireGenerated[idx]
+		} else {
+			outPath := ""
+			if dir, err := detectOutputDir(pkg.GoFiles); err == nil {
+				outPath = filepath.Join(dir, opts.PrefixOutputFile+"wire_gen.go")
+			}
+			generated[i] = GenerateResult{PkgPath: pkg.PkgPath, OutputPath: outPath}
+		}
 	}
 	if allGeneratedOK(generated) {
 		writeManifest(wd, env, patterns, opts, pkgs)
 	}
 	return generated, nil
+}
+
+// wireImportPaths are substrings that indicate a file imports the wire package
+// (handles both direct "wire." use and aliased imports like w "github.com/goforj/wire").
+var wireImportPaths = []string{"wire.", "goforj/wire", "kperreau/wire"}
+
+// packagesWithWire returns only packages that might contain wire injectors:
+// at least one Go file references "wire." or imports the wire package.
+// This avoids expensive type-checking for packages that cannot have wire injectors.
+// File reads are done in parallel across packages to reduce I/O wall time.
+func packagesWithWire(pkgs []*packages.Package) []*packages.Package {
+	if len(pkgs) == 0 {
+		return nil
+	}
+	hasWire := make([]bool, len(pkgs))
+	var wg sync.WaitGroup
+	for i, pkg := range pkgs {
+		wg.Add(1)
+		go func(i int, pkg *packages.Package) {
+			defer wg.Done()
+			files := pkg.CompiledGoFiles
+			if len(files) == 0 {
+				files = pkg.GoFiles
+			}
+			for _, f := range files {
+				data, err := os.ReadFile(f)
+				if err != nil {
+					continue
+				}
+				for _, sub := range wireImportPaths {
+					if bytes.Contains(data, []byte(sub)) {
+						hasWire[i] = true
+						return
+					}
+				}
+			}
+		}(i, pkg)
+	}
+	wg.Wait()
+	out := make([]*packages.Package, 0, len(pkgs))
+	for i, pkg := range pkgs {
+		if hasWire[i] {
+			out = append(out, pkg)
+		}
+	}
+	return out
 }
 
 // generateInjectors generates the injectors for a given package.
@@ -274,7 +408,7 @@ func (g *gen) frame(tags string) []byte {
 	return buf.Bytes()
 }
 
-func wireGoGeneratePath(pkg *packages.Package) string {
+func wireGoGeneratePath(_ *packages.Package) string {
 	return "github.com/goforj/wire"
 }
 

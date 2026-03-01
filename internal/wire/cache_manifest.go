@@ -15,7 +15,6 @@
 package wire
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -55,7 +54,7 @@ func readManifestResults(wd string, env []string, patterns []string, opts *Gener
 	if !ok {
 		return nil, false
 	}
-	if !manifestValid(manifest) {
+	if !manifestValid(manifest, opts) {
 		return nil, false
 	}
 	results := make([]GenerateResult, 0, len(manifest.Packages))
@@ -107,17 +106,18 @@ func writeManifest(wd string, env []string, patterns []string, opts *GenerateOpt
 			continue
 		}
 		outputPath := filepath.Join(outDir, opts.PrefixOutputFile+"wire_gen.go")
-		metaFiles, err := buildCacheFilesFunc(files)
+		statCache := opts.FileStatCache
+		metaFiles, err := buildCacheFilesFunc(files, statCache)
 		if err != nil {
 			continue
 		}
 		rootFiles := rootPackageFilesFunc(pkg)
 		sort.Strings(rootFiles)
-		rootMeta, err := buildCacheFilesFunc(rootFiles)
+		rootMeta, err := buildCacheFilesFunc(rootFiles, statCache)
 		if err != nil {
 			continue
 		}
-		rootHash, err := hashFilesFunc(rootFiles)
+		rootHash, err := hashFilesFunc(rootFiles, nil)
 		if err != nil {
 			continue
 		}
@@ -135,7 +135,8 @@ func writeManifest(wd string, env []string, patterns []string, opts *GenerateOpt
 
 // manifestKey builds the cache key for a given run configuration.
 func manifestKey(wd string, env []string, patterns []string, opts *GenerateOptions) string {
-	h := sha256.New()
+	h, release := getPooledSHA256()
+	defer release()
 	h.Write([]byte(cacheVersion))
 	h.Write([]byte{0})
 	h.Write([]byte(filepath.Clean(wd)))
@@ -160,7 +161,8 @@ func manifestKeyFromManifest(manifest *cacheManifest) string {
 	if manifest == nil {
 		return ""
 	}
-	h := sha256.New()
+	h, release := getPooledSHA256()
+	defer release()
 	h.Write([]byte(cacheVersion))
 	h.Write([]byte{0})
 	h.Write([]byte(filepath.Clean(manifest.WD)))
@@ -225,15 +227,19 @@ func cacheManifestPath(key string) string {
 }
 
 // manifestValid reports whether the manifest still matches current inputs.
-func manifestValid(manifest *cacheManifest) bool {
+func manifestValid(manifest *cacheManifest, opts *GenerateOptions) bool {
 	if manifest == nil || manifest.Version != cacheVersion {
 		return false
 	}
 	if manifest.EnvHash == "" || len(manifest.Packages) == 0 {
 		return false
 	}
+	var statCache *FileStatCache
+	if opts != nil {
+		statCache = opts.FileStatCache
+	}
 	if len(manifest.ExtraFiles) > 0 {
-		current, err := buildCacheFilesFromMetaFunc(manifest.ExtraFiles)
+		current, err := buildCacheFilesFromMetaFunc(manifest.ExtraFiles, statCache)
 		if err != nil {
 			return false
 		}
@@ -254,7 +260,7 @@ func manifestValid(manifest *cacheManifest) bool {
 		if len(pkg.RootFiles) == 0 || pkg.RootHash == "" {
 			return false
 		}
-		current, err := buildCacheFilesFromMetaFunc(pkg.Files)
+		current, err := buildCacheFilesFromMetaFunc(pkg.Files, statCache)
 		if err != nil {
 			return false
 		}
@@ -266,7 +272,7 @@ func manifestValid(manifest *cacheManifest) bool {
 				return false
 			}
 		}
-		rootCurrent, err := buildCacheFilesFromMetaFunc(pkg.RootFiles)
+		rootCurrent, err := buildCacheFilesFromMetaFunc(pkg.RootFiles, statCache)
 		if err != nil {
 			return false
 		}
@@ -283,7 +289,7 @@ func manifestValid(manifest *cacheManifest) bool {
 			rootPaths = append(rootPaths, file.Path)
 		}
 		sort.Strings(rootPaths)
-		rootHash, err := hashFiles(rootPaths)
+		rootHash, err := hashFiles(rootPaths, nil)
 		if err != nil || rootHash != pkg.RootHash {
 			return false
 		}
@@ -292,18 +298,30 @@ func manifestValid(manifest *cacheManifest) bool {
 }
 
 // buildCacheFilesFromMeta re-stats files to compare metadata.
-func buildCacheFilesFromMeta(files []cacheFile) ([]cacheFile, error) {
+// If cache is non-nil, stat results are reused.
+func buildCacheFilesFromMeta(files []cacheFile, cache *FileStatCache) ([]cacheFile, error) {
 	out := make([]cacheFile, 0, len(files))
 	for _, file := range files {
+		path := filepath.Clean(file.Path)
+		if cache != nil {
+			if cf, ok := cache.load(path); ok {
+				out = append(out, *cf)
+				continue
+			}
+		}
 		info, err := osStat(file.Path)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, cacheFile{
-			Path:    filepath.Clean(file.Path),
+		cf := &cacheFile{
+			Path:    path,
 			Size:    info.Size(),
 			ModTime: info.ModTime().UnixNano(),
-		})
+		}
+		if cache != nil {
+			cache.store(path, cf)
+		}
+		out = append(out, *cf)
 	}
 	return out, nil
 }
@@ -385,7 +403,8 @@ func envHash(env []string) string {
 		return ""
 	}
 	sorted := sortedStrings(env)
-	h := sha256.New()
+	h, release := getPooledSHA256()
+	defer release()
 	for _, v := range sorted {
 		h.Write([]byte(v))
 		h.Write([]byte{0})

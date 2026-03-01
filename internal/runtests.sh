@@ -34,8 +34,9 @@ fi
 
 echo
 echo "Ensuring .go files are formatted with gofmt -s..."
-mapfile -t go_files < <(find . -name '*.go' -type f | grep -v testdata)
-DIFF="$(gofmt -s -d "${go_files[@]}")"
+go_files=()
+while IFS= read -r f; do go_files+=("$f"); done < <(find . -name '*.go' -type f | grep -v testdata)
+DIFF="$(gofmt -s -d "${go_files[@]:-}")"
 if [ -n "$DIFF" ]; then
   echo "FAIL: please run gofmt -s and commit the result"
   echo "$DIFF";

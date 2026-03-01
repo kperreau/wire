@@ -124,6 +124,7 @@ func TestLoadModuleUsesWireinjectTagsForDeps(t *testing.T) {
 		"",
 	}, "\n"))
 
+	runGoModTidy(t, root)
 	env := append(os.Environ(), "GOWORK=off")
 	ctx := context.Background()
 

@@ -111,6 +111,7 @@ func TestGenerateForPackageFormatError(t *testing.T) {
 		"",
 	}, "\n"))
 
+	runGoModTidy(t, tempDir)
 	ctx := context.Background()
 	env := append(os.Environ(), "GOWORK=off")
 	pkgs, loader, errs := load(ctx, tempDir, env, "", []string{"./app"})

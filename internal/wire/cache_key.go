@@ -17,11 +17,33 @@ package wire
 import (
 	"crypto/sha256"
 	"fmt"
+	"hash"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
 
 	"golang.org/x/tools/go/packages"
 )
+
+const maxParallelReads = 8
+
+// sha256HasherPool reuses sha256 hashers to avoid per-call allocations.
+// Initialized at package load; hashers are Reset before Put.
+var sha256HasherPool = sync.Pool{
+	New: func() any { return sha256.New() },
+}
+
+// getPooledSHA256 returns a hasher from the pool and a release function that
+// Resets and returns it. Call release when done (e.g. defer release()).
+func getPooledSHA256() (hash.Hash, func()) {
+	h := sha256HasherPool.Get().(hash.Hash)
+	h.Reset()
+	return h, func() {
+		h.Reset()
+		sha256HasherPool.Put(h)
+	}
+}
 
 // cacheVersion is the schema/version identifier for cache entries.
 const cacheVersion = "wire-cache-v3"
@@ -64,11 +86,19 @@ func cacheKeyForPackage(pkg *packages.Package, opts *GenerateOptions) (string, e
 	}
 	rootFiles := rootPackageFiles(pkg)
 	sort.Strings(rootFiles)
-	rootHash, err := hashFiles(rootFiles)
+	var cache *FileHashCache
+	if opts != nil {
+		cache = opts.FileHashCache
+	}
+	rootHash, err := hashFiles(rootFiles, cache)
 	if err != nil {
 		return "", err
 	}
-	metaFiles, err := buildCacheFiles(files)
+	var statCache *FileStatCache
+	if opts != nil {
+		statCache = opts.FileStatCache
+	}
+	metaFiles, err := buildCacheFiles(files, statCache)
 	if err != nil {
 		return "", err
 	}
@@ -115,7 +145,8 @@ func packageFiles(root *packages.Package) []string {
 
 // cacheMetaKey builds the key for a package's cache metadata entry.
 func cacheMetaKey(pkg *packages.Package, opts *GenerateOptions) string {
-	h := sha256.New()
+	h, release := getPooledSHA256()
+	defer release()
 	h.Write([]byte(cacheVersion))
 	h.Write([]byte{0})
 	h.Write([]byte(pkg.PkgPath))
@@ -186,7 +217,11 @@ func cacheMetaMatches(meta *cacheMeta, pkg *packages.Package, opts *GenerateOpti
 	if len(meta.Files) != len(files) {
 		return false
 	}
-	current, err := buildCacheFiles(files)
+	var statCache *FileStatCache
+	if opts != nil {
+		statCache = opts.FileStatCache
+	}
+	current, err := buildCacheFiles(files, statCache)
 	if err != nil {
 		return false
 	}
@@ -200,7 +235,11 @@ func cacheMetaMatches(meta *cacheMeta, pkg *packages.Package, opts *GenerateOpti
 		return false
 	}
 	sort.Strings(rootFiles)
-	rootHash, err := hashFiles(rootFiles)
+	var cache *FileHashCache
+	if opts != nil {
+		cache = opts.FileHashCache
+	}
+	rootHash, err := hashFiles(rootFiles, cache)
 	if err != nil || rootHash != meta.RootHash {
 		return false
 	}
@@ -208,18 +247,30 @@ func cacheMetaMatches(meta *cacheMeta, pkg *packages.Package, opts *GenerateOpti
 }
 
 // buildCacheFiles converts file paths into cache metadata entries.
-func buildCacheFiles(files []string) ([]cacheFile, error) {
+// If cache is non-nil, stat results are reused to avoid redundant os.Stat.
+func buildCacheFiles(files []string, cache *FileStatCache) ([]cacheFile, error) {
 	out := make([]cacheFile, 0, len(files))
 	for _, name := range files {
+		path := filepath.Clean(name)
+		if cache != nil {
+			if cf, ok := cache.load(path); ok {
+				out = append(out, *cf)
+				continue
+			}
+		}
 		info, err := osStat(name)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, cacheFile{
-			Path:    filepath.Clean(name),
+		cf := &cacheFile{
+			Path:    path,
 			Size:    info.Size(),
 			ModTime: info.ModTime().UnixNano(),
-		})
+		}
+		if cache != nil {
+			cache.store(path, cf)
+		}
+		out = append(out, *cf)
 	}
 	return out, nil
 }
@@ -238,9 +289,85 @@ func contentHashForFiles(pkg *packages.Package, opts *GenerateOptions, files []s
 	return contentHashForPaths(pkg.PkgPath, opts, files)
 }
 
+// fileContentHash returns the SHA256 hex hash of the file's content, using cache if set.
+func fileContentHash(path string, cache *FileHashCache) (string, error) {
+	if cache != nil {
+		if h, ok := cache.load(path); ok {
+			return h, nil
+		}
+	}
+	data, err := osReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	hash := fmt.Sprintf("%x", sum[:])
+	if cache != nil {
+		cache.store(path, hash)
+	}
+	return hash, nil
+}
+
+// fileContentHashesParallel returns SHA256 hex hashes for each path in order, reading
+// cache misses in parallel to reduce I/O wall time.
+func fileContentHashesParallel(paths []string, cache *FileHashCache) ([]string, error) {
+	hashes := make([]string, len(paths))
+	var toRead []int
+	for i, path := range paths {
+		if cache != nil {
+			if h, ok := cache.load(path); ok {
+				hashes[i] = h
+				continue
+			}
+		}
+		toRead = append(toRead, i)
+	}
+	if len(toRead) == 0 {
+		return hashes, nil
+	}
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	results := make([]readResult, len(toRead))
+	workers := maxParallelReads
+	if n := runtime.GOMAXPROCS(0); n < workers && n > 0 {
+		workers = n
+	}
+	if workers > len(toRead) {
+		workers = len(toRead)
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, workers)
+	for j, idx := range toRead {
+		wg.Add(1)
+		go func(j int, path string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			data, err := osReadFile(path)
+			<-sem
+			results[j] = readResult{data, err}
+		}(j, paths[idx])
+	}
+	wg.Wait()
+	for j, idx := range toRead {
+		if results[j].err != nil {
+			return nil, results[j].err
+		}
+		sum := sha256.Sum256(results[j].data)
+		hash := fmt.Sprintf("%x", sum[:])
+		if cache != nil {
+			cache.store(paths[idx], hash)
+		}
+		hashes[idx] = hash
+	}
+	return hashes, nil
+}
+
 // contentHashForPaths hashes the provided file contents and options.
 func contentHashForPaths(pkgPath string, opts *GenerateOptions, files []string) (string, error) {
-	h := sha256.New()
+	h, release := getPooledSHA256()
+	defer release()
 	h.Write([]byte(cacheVersion))
 	h.Write([]byte{0})
 	h.Write([]byte(pkgPath))
@@ -251,14 +378,18 @@ func contentHashForPaths(pkgPath string, opts *GenerateOptions, files []string) 
 	h.Write([]byte{0})
 	h.Write([]byte(headerHash(opts.Header)))
 	h.Write([]byte{0})
-	for _, name := range files {
+	var cache *FileHashCache
+	if opts != nil {
+		cache = opts.FileHashCache
+	}
+	fileHashes, err := fileContentHashesParallel(files, cache)
+	if err != nil {
+		return "", err
+	}
+	for i, name := range files {
 		h.Write([]byte(name))
 		h.Write([]byte{0})
-		data, err := osReadFile(name)
-		if err != nil {
-			return "", err
-		}
-		h.Write(data)
+		h.Write([]byte(fileHashes[i]))
 		h.Write([]byte{0})
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
@@ -279,19 +410,21 @@ func rootPackageFiles(pkg *packages.Package) []string {
 }
 
 // hashFiles returns a combined content hash for the provided paths.
-func hashFiles(files []string) (string, error) {
+// If cache is non-nil, file content hashes are reused to avoid redundant reads.
+func hashFiles(files []string, cache *FileHashCache) (string, error) {
 	if len(files) == 0 {
 		return "", nil
 	}
-	h := sha256.New()
-	for _, name := range files {
+	fileHashes, err := fileContentHashesParallel(files, cache)
+	if err != nil {
+		return "", err
+	}
+	h, release := getPooledSHA256()
+	defer release()
+	for i, name := range files {
 		h.Write([]byte(name))
 		h.Write([]byte{0})
-		data, err := osReadFile(name)
-		if err != nil {
-			return "", err
-		}
-		h.Write(data)
+		h.Write([]byte(fileHashes[i]))
 		h.Write([]byte{0})
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
