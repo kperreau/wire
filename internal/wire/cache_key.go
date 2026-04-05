@@ -16,11 +16,14 @@ package wire
 
 import (
 	"crypto/sha256"
-	"fmt"
+	"encoding/hex"
 	"hash"
+	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 
 	"golang.org/x/tools/go/packages"
@@ -43,6 +46,13 @@ func getPooledSHA256() (hash.Hash, func()) {
 		h.Reset()
 		sha256HasherPool.Put(h)
 	}
+}
+
+// sumHex returns the hex-encoded hash digest without allocating an intermediate
+// byte slice for the sum (uses a stack-allocated [sha256.Size]byte buffer).
+func sumHex(h hash.Hash) string {
+	var buf [sha256.Size]byte
+	return hex.EncodeToString(h.Sum(buf[:0]))
 }
 
 // cacheVersion is the schema/version identifier for cache entries.
@@ -116,8 +126,11 @@ func cacheKeyForPackage(pkg *packages.Package, opts *GenerateOptions) (string, e
 	return contentHash, nil
 }
 
-// packageFiles returns the transitive Go files for a package graph.
+// packageFiles returns Go files for the local module packages in a dependency graph.
+// External packages (under GOMODCACHE or GOROOT) are excluded — their integrity
+// is tracked via go.mod/go.sum in extraCacheFiles.
 func packageFiles(root *packages.Package) []string {
+	excludePrefixes := externalPrefixes()
 	seen := make(map[string]struct{})
 	var files []string
 	stack := []*packages.Package{root}
@@ -131,10 +144,12 @@ func packageFiles(root *packages.Package) []string {
 			continue
 		}
 		seen[p.PkgPath] = struct{}{}
-		if len(p.CompiledGoFiles) > 0 {
-			files = append(files, p.CompiledGoFiles...)
-		} else if len(p.GoFiles) > 0 {
-			files = append(files, p.GoFiles...)
+		goFiles := p.CompiledGoFiles
+		if len(goFiles) == 0 {
+			goFiles = p.GoFiles
+		}
+		if len(goFiles) > 0 && !isExternalPath(goFiles[0], excludePrefixes) {
+			files = append(files, goFiles...)
 		}
 		for _, imp := range p.Imports {
 			stack = append(stack, imp)
@@ -143,20 +158,60 @@ func packageFiles(root *packages.Package) []string {
 	return files
 }
 
+// cachedExternalPrefixes caches the result of externalPrefixes so it is
+// computed at most once per process.
+var cachedExternalPrefixes struct {
+	once     sync.Once
+	prefixes []string
+}
+
+// externalPrefixes returns path prefixes for directories containing external
+// (non-local) Go packages: GOMODCACHE and GOROOT. Cached after first call.
+func externalPrefixes() []string {
+	cachedExternalPrefixes.once.Do(func() {
+		var prefixes []string
+		if modCache := os.Getenv("GOMODCACHE"); modCache != "" {
+			prefixes = append(prefixes, filepath.Clean(modCache)+string(filepath.Separator))
+		}
+		if gopath := os.Getenv("GOPATH"); gopath != "" {
+			prefixes = append(prefixes, filepath.Join(filepath.Clean(gopath), "pkg", "mod")+string(filepath.Separator))
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			prefixes = append(prefixes, filepath.Join(home, "go", "pkg", "mod")+string(filepath.Separator))
+		}
+		if goroot := runtime.GOROOT(); goroot != "" {
+			prefixes = append(prefixes, filepath.Clean(goroot)+string(filepath.Separator))
+		}
+		cachedExternalPrefixes.prefixes = prefixes
+	})
+	return cachedExternalPrefixes.prefixes
+}
+
+// isExternalPath reports whether the file path is under an external prefix.
+func isExternalPath(path string, prefixes []string) bool {
+	clean := filepath.Clean(path)
+	for _, p := range prefixes {
+		if strings.HasPrefix(clean, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // cacheMetaKey builds the key for a package's cache metadata entry.
 func cacheMetaKey(pkg *packages.Package, opts *GenerateOptions) string {
 	h, release := getPooledSHA256()
 	defer release()
-	h.Write([]byte(cacheVersion))
+	io.WriteString(h, cacheVersion)
 	h.Write([]byte{0})
-	h.Write([]byte(pkg.PkgPath))
+	io.WriteString(h, pkg.PkgPath)
 	h.Write([]byte{0})
-	h.Write([]byte(opts.Tags))
+	io.WriteString(h, opts.Tags)
 	h.Write([]byte{0})
-	h.Write([]byte(opts.PrefixOutputFile))
+	io.WriteString(h, opts.PrefixOutputFile)
 	h.Write([]byte{0})
-	h.Write([]byte(headerHash(opts.Header)))
-	return fmt.Sprintf("%x", h.Sum(nil))
+	io.WriteString(h, headerHash(opts.Header))
+	return sumHex(h)
 }
 
 // cacheMetaPath returns the on-disk path for a cache metadata key.
@@ -249,12 +304,12 @@ func cacheMetaMatches(meta *cacheMeta, pkg *packages.Package, opts *GenerateOpti
 // buildCacheFiles converts file paths into cache metadata entries.
 // If cache is non-nil, stat results are reused to avoid redundant os.Stat.
 func buildCacheFiles(files []string, cache *FileStatCache) ([]cacheFile, error) {
-	out := make([]cacheFile, 0, len(files))
-	for _, name := range files {
+	out := make([]cacheFile, len(files))
+	for i, name := range files {
 		path := filepath.Clean(name)
 		if cache != nil {
 			if cf, ok := cache.load(path); ok {
-				out = append(out, *cf)
+				out[i] = *cf
 				continue
 			}
 		}
@@ -262,15 +317,15 @@ func buildCacheFiles(files []string, cache *FileStatCache) ([]cacheFile, error) 
 		if err != nil {
 			return nil, err
 		}
-		cf := &cacheFile{
+		cf := cacheFile{
 			Path:    path,
 			Size:    info.Size(),
 			ModTime: info.ModTime().UnixNano(),
 		}
 		if cache != nil {
-			cache.store(path, cf)
+			cache.store(path, &cf)
 		}
-		out = append(out, *cf)
+		out[i] = cf
 	}
 	return out, nil
 }
@@ -281,7 +336,7 @@ func headerHash(header []byte) string {
 		return ""
 	}
 	sum := sha256.Sum256(header)
-	return fmt.Sprintf("%x", sum[:])
+	return hex.EncodeToString(sum[:])
 }
 
 // contentHashForFiles hashes the current package inputs using file paths.
@@ -301,11 +356,11 @@ func fileContentHash(path string, cache *FileHashCache) (string, error) {
 		return "", err
 	}
 	sum := sha256.Sum256(data)
-	hash := fmt.Sprintf("%x", sum[:])
+	h := hex.EncodeToString(sum[:])
 	if cache != nil {
-		cache.store(path, hash)
+		cache.store(path, h)
 	}
-	return hash, nil
+	return h, nil
 }
 
 // fileContentHashesParallel returns SHA256 hex hashes for each path in order, reading
@@ -355,11 +410,11 @@ func fileContentHashesParallel(paths []string, cache *FileHashCache) ([]string, 
 			return nil, results[j].err
 		}
 		sum := sha256.Sum256(results[j].data)
-		hash := fmt.Sprintf("%x", sum[:])
+		h := hex.EncodeToString(sum[:])
 		if cache != nil {
-			cache.store(paths[idx], hash)
+			cache.store(paths[idx], h)
 		}
-		hashes[idx] = hash
+		hashes[idx] = h
 	}
 	return hashes, nil
 }
@@ -368,15 +423,15 @@ func fileContentHashesParallel(paths []string, cache *FileHashCache) ([]string, 
 func contentHashForPaths(pkgPath string, opts *GenerateOptions, files []string) (string, error) {
 	h, release := getPooledSHA256()
 	defer release()
-	h.Write([]byte(cacheVersion))
+	io.WriteString(h, cacheVersion)
 	h.Write([]byte{0})
-	h.Write([]byte(pkgPath))
+	io.WriteString(h, pkgPath)
 	h.Write([]byte{0})
-	h.Write([]byte(opts.Tags))
+	io.WriteString(h, opts.Tags)
 	h.Write([]byte{0})
-	h.Write([]byte(opts.PrefixOutputFile))
+	io.WriteString(h, opts.PrefixOutputFile)
 	h.Write([]byte{0})
-	h.Write([]byte(headerHash(opts.Header)))
+	io.WriteString(h, headerHash(opts.Header))
 	h.Write([]byte{0})
 	var cache *FileHashCache
 	if opts != nil {
@@ -387,12 +442,12 @@ func contentHashForPaths(pkgPath string, opts *GenerateOptions, files []string) 
 		return "", err
 	}
 	for i, name := range files {
-		h.Write([]byte(name))
+		io.WriteString(h, name)
 		h.Write([]byte{0})
-		h.Write([]byte(fileHashes[i]))
+		io.WriteString(h, fileHashes[i])
 		h.Write([]byte{0})
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return sumHex(h), nil
 }
 
 // rootPackageFiles returns the direct Go files for the root package.
@@ -422,10 +477,10 @@ func hashFiles(files []string, cache *FileHashCache) (string, error) {
 	h, release := getPooledSHA256()
 	defer release()
 	for i, name := range files {
-		h.Write([]byte(name))
+		io.WriteString(h, name)
 		h.Write([]byte{0})
-		h.Write([]byte(fileHashes[i]))
+		io.WriteString(h, fileHashes[i])
 		h.Write([]byte{0})
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return sumHex(h), nil
 }

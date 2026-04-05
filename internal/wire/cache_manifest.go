@@ -15,7 +15,7 @@
 package wire
 
 import (
-	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 
@@ -137,23 +137,23 @@ func writeManifest(wd string, env []string, patterns []string, opts *GenerateOpt
 func manifestKey(wd string, env []string, patterns []string, opts *GenerateOptions) string {
 	h, release := getPooledSHA256()
 	defer release()
-	h.Write([]byte(cacheVersion))
+	io.WriteString(h, cacheVersion)
 	h.Write([]byte{0})
-	h.Write([]byte(filepath.Clean(wd)))
+	io.WriteString(h, filepath.Clean(wd))
 	h.Write([]byte{0})
-	h.Write([]byte(envHash(env)))
+	io.WriteString(h, envHash(env))
 	h.Write([]byte{0})
-	h.Write([]byte(opts.Tags))
+	io.WriteString(h, opts.Tags)
 	h.Write([]byte{0})
-	h.Write([]byte(opts.PrefixOutputFile))
+	io.WriteString(h, opts.PrefixOutputFile)
 	h.Write([]byte{0})
-	h.Write([]byte(headerHash(opts.Header)))
+	io.WriteString(h, headerHash(opts.Header))
 	h.Write([]byte{0})
 	for _, p := range sortedStrings(patterns) {
-		h.Write([]byte(p))
+		io.WriteString(h, p)
 		h.Write([]byte{0})
 	}
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return sumHex(h)
 }
 
 // manifestKeyFromManifest rebuilds the cache key from stored metadata.
@@ -163,23 +163,23 @@ func manifestKeyFromManifest(manifest *cacheManifest) string {
 	}
 	h, release := getPooledSHA256()
 	defer release()
-	h.Write([]byte(cacheVersion))
+	io.WriteString(h, cacheVersion)
 	h.Write([]byte{0})
-	h.Write([]byte(filepath.Clean(manifest.WD)))
+	io.WriteString(h, filepath.Clean(manifest.WD))
 	h.Write([]byte{0})
-	h.Write([]byte(manifest.EnvHash))
+	io.WriteString(h, manifest.EnvHash)
 	h.Write([]byte{0})
-	h.Write([]byte(manifest.Tags))
+	io.WriteString(h, manifest.Tags)
 	h.Write([]byte{0})
-	h.Write([]byte(manifest.Prefix))
+	io.WriteString(h, manifest.Prefix)
 	h.Write([]byte{0})
-	h.Write([]byte(manifest.HeaderHash))
+	io.WriteString(h, manifest.HeaderHash)
 	h.Write([]byte{0})
 	for _, p := range sortedStrings(manifest.Patterns) {
-		h.Write([]byte(p))
+		io.WriteString(h, p)
 		h.Write([]byte{0})
 	}
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return sumHex(h)
 }
 
 // readManifest loads the cached manifest by key.
@@ -227,6 +227,12 @@ func cacheManifestPath(key string) string {
 }
 
 // manifestValid reports whether the manifest still matches current inputs.
+//
+// Validation strategy:
+//  1. Check extra files (go.mod, go.sum, go.work) — captures external dep changes.
+//  2. For each package, stat-check local dependency files (pkg.Files).
+//  3. Stat-check root files and always verify root content hash (catches
+//     same-timestamp edits). Uses hash cache to avoid redundant reads.
 func manifestValid(manifest *cacheManifest, opts *GenerateOptions) bool {
 	if manifest == nil || manifest.Version != cacheVersion {
 		return false
@@ -235,9 +241,12 @@ func manifestValid(manifest *cacheManifest, opts *GenerateOptions) bool {
 		return false
 	}
 	var statCache *FileStatCache
+	var hashCache *FileHashCache
 	if opts != nil {
 		statCache = opts.FileStatCache
+		hashCache = opts.FileHashCache
 	}
+	// 1. Validate extra files (go.mod, go.sum, go.work).
 	if len(manifest.ExtraFiles) > 0 {
 		current, err := buildCacheFilesFromMetaFunc(manifest.ExtraFiles, statCache)
 		if err != nil {
@@ -252,6 +261,7 @@ func manifestValid(manifest *cacheManifest, opts *GenerateOptions) bool {
 			}
 		}
 	}
+	// 2. Validate each package.
 	for i := range manifest.Packages {
 		pkg := manifest.Packages[i]
 		if pkg.ContentHash == "" {
@@ -260,6 +270,7 @@ func manifestValid(manifest *cacheManifest, opts *GenerateOptions) bool {
 		if len(pkg.RootFiles) == 0 || pkg.RootHash == "" {
 			return false
 		}
+		// Stat-check all local dependency files.
 		current, err := buildCacheFilesFromMetaFunc(pkg.Files, statCache)
 		if err != nil {
 			return false
@@ -272,6 +283,7 @@ func manifestValid(manifest *cacheManifest, opts *GenerateOptions) bool {
 				return false
 			}
 		}
+		// Stat-check root files.
 		rootCurrent, err := buildCacheFilesFromMetaFunc(pkg.RootFiles, statCache)
 		if err != nil {
 			return false
@@ -284,12 +296,13 @@ func manifestValid(manifest *cacheManifest, opts *GenerateOptions) bool {
 				return false
 			}
 		}
-		rootPaths := make([]string, 0, len(pkg.RootFiles))
-		for _, file := range pkg.RootFiles {
-			rootPaths = append(rootPaths, file.Path)
+		// Always verify root content hash (catches same-timestamp edits).
+		rootPaths := make([]string, len(pkg.RootFiles))
+		for j, file := range pkg.RootFiles {
+			rootPaths[j] = file.Path
 		}
 		sort.Strings(rootPaths)
-		rootHash, err := hashFiles(rootPaths, nil)
+		rootHash, err := hashFiles(rootPaths, hashCache)
 		if err != nil || rootHash != pkg.RootHash {
 			return false
 		}
@@ -300,28 +313,28 @@ func manifestValid(manifest *cacheManifest, opts *GenerateOptions) bool {
 // buildCacheFilesFromMeta re-stats files to compare metadata.
 // If cache is non-nil, stat results are reused.
 func buildCacheFilesFromMeta(files []cacheFile, cache *FileStatCache) ([]cacheFile, error) {
-	out := make([]cacheFile, 0, len(files))
-	for _, file := range files {
-		path := filepath.Clean(file.Path)
+	out := make([]cacheFile, len(files))
+	for i := range files {
+		path := filepath.Clean(files[i].Path)
 		if cache != nil {
 			if cf, ok := cache.load(path); ok {
-				out = append(out, *cf)
+				out[i] = *cf
 				continue
 			}
 		}
-		info, err := osStat(file.Path)
+		info, err := osStat(files[i].Path)
 		if err != nil {
 			return nil, err
 		}
-		cf := &cacheFile{
+		cf := cacheFile{
 			Path:    path,
 			Size:    info.Size(),
 			ModTime: info.ModTime().UnixNano(),
 		}
 		if cache != nil {
-			cache.store(path, cf)
+			cache.store(path, &cf)
 		}
-		out = append(out, *cf)
+		out[i] = cf
 	}
 	return out, nil
 }
@@ -406,8 +419,8 @@ func envHash(env []string) string {
 	h, release := getPooledSHA256()
 	defer release()
 	for _, v := range sorted {
-		h.Write([]byte(v))
+		io.WriteString(h, v)
 		h.Write([]byte{0})
 	}
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return sumHex(h)
 }
