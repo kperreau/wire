@@ -52,8 +52,7 @@ func BenchmarkRealWorldColdNoCache(b *testing.B) {
 	env := benchEnv()
 	ctx := context.Background()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		b.StopTimer()
 		tmpDir := b.TempDir()
 		origTmp := os.Getenv("TMPDIR")
@@ -96,8 +95,7 @@ func BenchmarkRealWorldWarmCache(b *testing.B) {
 		b.Fatalf("warm Generate: %v", errs)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		opts := &GenerateOptions{}
 		_, errs := Generate(ctx, root, env, []string{"./..."}, opts)
 		if len(errs) > 0 {
@@ -583,8 +581,8 @@ func TestRealWorldTimingBreakdown(t *testing.T) {
 func BenchmarkRealWorldEnvHash(b *testing.B) {
 	env := benchEnv()
 	b.ReportMetric(float64(len(env)), "env-vars")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		h := envHash(env)
 		if h == "" {
 			b.Fatal("empty hash")
@@ -598,8 +596,7 @@ func BenchmarkRealWorldManifestKey(b *testing.B) {
 	env := benchEnv()
 	opts := &GenerateOptions{}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		k := manifestKey(root, env, []string{"./..."}, opts)
 		if k == "" {
 			b.Fatal("empty key")
@@ -666,9 +663,8 @@ func BenchmarkRealWorldManifestReadWrite(b *testing.B) {
 func BenchmarkRealWorldExtraCacheFiles(b *testing.B) {
 	root := homiclipBackendPath(b)
 
-	b.ResetTimer()
 	var count int
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		files := extraCacheFiles(root)
 		count = len(files)
 	}
