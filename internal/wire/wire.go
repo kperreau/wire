@@ -158,11 +158,70 @@ func Generate(ctx context.Context, wd string, env []string, patterns []string, o
 		wireSet[p.PkgPath] = i
 	}
 	wireGenerated := make([]GenerateResult, len(wirePkgs))
+
+	// First pass: check per-package cache to find which packages need generation.
+	// Packages with valid caches don't need expensive type-checking.
+	needsGen := make([]bool, len(wirePkgs))
+	var genPaths []string
+	for i, pkg := range wirePkgs {
+		cacheKey, err := cacheKeyForPackage(pkg, opts)
+		if err != nil || cacheKey == "" {
+			needsGen[i] = true
+			genPaths = append(genPaths, pkg.PkgPath)
+			continue
+		}
+		if cached, ok := readCache(cacheKey); ok {
+			outDir, err := detectOutputDir(pkg.GoFiles)
+			if err != nil {
+				needsGen[i] = true
+				genPaths = append(genPaths, pkg.PkgPath)
+				continue
+			}
+			wireGenerated[i] = GenerateResult{
+				PkgPath:    pkg.PkgPath,
+				OutputPath: filepath.Join(outDir, opts.PrefixOutputFile+"wire_gen.go"),
+				Content:    cached,
+			}
+			continue
+		}
+		needsGen[i] = true
+		genPaths = append(genPaths, pkg.PkgPath)
+	}
+
+	// Batch-load all packages that need generation with full type info in a single call.
+	// This is dramatically faster than individual loads because shared deps are type-checked once.
+	// If batch loading fails, generateForPackage falls back to individual lazy loading.
+	if len(genPaths) > 0 {
+		batchStart := time.Now()
+		batchPkgs, errs := loader.loadBatch(genPaths)
+		logTiming(ctx, "generate.batch_load", batchStart)
+		if len(errs) == 0 {
+			// Build map from batch-loaded packages for lookup.
+			batchMap := make(map[string]*packages.Package, len(batchPkgs))
+			for _, p := range batchPkgs {
+				batchMap[p.PkgPath] = p
+			}
+			// Replace wire packages with fully-loaded versions.
+			for i, pkg := range wirePkgs {
+				if needsGen[i] {
+					if loaded, ok := batchMap[pkg.PkgPath]; ok {
+						wirePkgs[i] = loaded
+					}
+				}
+			}
+		}
+		// If batch failed, each generateForPackage will use the lazy loader as fallback.
+	}
+
+	// Generate code for packages that didn't have cache hits.
 	workers := max(min(runtime.GOMAXPROCS(0), 4), 1)
 	var wg sync.WaitGroup
 	for i := 0; i < len(wirePkgs); i += workers {
 		end := min(i+workers, len(wirePkgs))
 		for j := i; j < end; j++ {
+			if !needsGen[j] {
+				continue
+			}
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
@@ -185,7 +244,7 @@ func Generate(ctx context.Context, wd string, env []string, patterns []string, o
 		}
 	}
 	if allGeneratedOK(generated) {
-		writeManifest(wd, env, patterns, opts, pkgs)
+		writeManifest(wd, env, patterns, opts, wirePkgs)
 	}
 	return generated, nil
 }

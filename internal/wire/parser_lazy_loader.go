@@ -73,6 +73,82 @@ func (ll *lazyLoader) load(pkgPath string) ([]*packages.Package, []error) {
 	return ll.loadWithMode(pkgPath, ll.fullMode(), "load.packages.lazy.load")
 }
 
+// loadBatch loads multiple packages with full type information in a single
+// packages.Load call. This is dramatically faster than loading each package
+// individually because shared dependencies are type-checked only once.
+func (ll *lazyLoader) loadBatch(pkgPaths []string) ([]*packages.Package, []error) {
+	if len(pkgPaths) == 0 {
+		return nil, nil
+	}
+
+	// Build the set of primary files from all requested packages.
+	primaryFiles := make(map[string]struct{})
+	for _, pkgPath := range pkgPaths {
+		if files, ok := ll.baseFiles[pkgPath]; ok {
+			for f := range files {
+				primaryFiles[f] = struct{}{}
+			}
+		}
+	}
+
+	cfg := &packages.Config{
+		Context:    ll.ctx,
+		Mode:       ll.fullMode(),
+		Dir:        ll.wd,
+		Env:        ll.env,
+		BuildFlags: []string{"-tags=wireinject"},
+		Fset:       ll.fset,
+		ParseFile:  parseFileForSet(primaryFiles),
+	}
+	if len(ll.tags) > 0 {
+		cfg.BuildFlags[0] += " " + ll.tags
+	}
+
+	patterns := make([]string, len(pkgPaths))
+	for i, p := range pkgPaths {
+		patterns[i] = "pattern=" + p
+	}
+
+	loadStart := time.Now()
+	pkgs, err := packages.Load(cfg, patterns...)
+	logTiming(ll.ctx, "load.packages.batch", loadStart)
+	if err != nil {
+		return nil, []error{err}
+	}
+	errs := collectLoadErrors(pkgs)
+	if len(errs) > 0 {
+		return nil, errs
+	}
+	return pkgs, nil
+}
+
+// parseFileForSet returns a parse function that parses files in the primary set
+// with full comments and preserves function bodies, while stripping bodies from
+// non-primary files to reduce type-checking work.
+func parseFileForSet(primaryFiles map[string]struct{}) func(*token.FileSet, string, []byte) (*ast.File, error) {
+	return func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
+		mode := parser.SkipObjectResolution
+		if _, ok := primaryFiles[filepath.Clean(filename)]; ok {
+			mode = parser.ParseComments | parser.SkipObjectResolution
+		}
+		file, err := parser.ParseFile(fset, filename, src, mode)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := primaryFiles[filepath.Clean(filename)]; ok {
+			return file, nil
+		}
+		// Strip function bodies for non-primary packages to reduce work.
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				fn.Body = nil
+				fn.Doc = nil
+			}
+		}
+		return file, nil
+	}
+}
+
 func (ll *lazyLoader) fullMode() packages.LoadMode {
 	return packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedDeps | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedSyntax
 }
